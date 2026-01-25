@@ -3,7 +3,7 @@
 // ==========================================
 // 1. CONFIGURATION
 // ==========================================
-$botToken = "8100882870:AAFUwU2C-E0BUADBe2vl_1SrJ-hPgFCmAPo"; // Put your token here
+$botToken = "8444531043:AAGSXIFDqVPX6VCtWfNblP0S9wgbhnMK3H8"; // Put your token here
 $apiUrl   = "https://api.telegram.org/bot$botToken";
 
 
