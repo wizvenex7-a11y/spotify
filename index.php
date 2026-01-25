@@ -3,53 +3,73 @@
 // ==========================================
 // 1. CONFIGURATION
 // ==========================================
-$botToken = "8336071481:AAG91IOKs6r3b5SGIrC_gR4tmfjOnV_dQE8"; // Put your token here
-$apiUrl   = "https://api.telegram.org/bot$botToken";
+$botToken = "8336071481:AAG91IOKs6r3b5SGIrC_gR4tmfjOnV_dQE8"; // YOUR TOKEN
+$apiUrl   = "https://api.telegram.org/bot{$botToken}";
 
-
-/* ================= HEX CHECK ================= */
+// ==========================================
+// 2. FUNCTIONS
+// ==========================================
 function isHexBase16($s) {
     return $s !== "" && ctype_xdigit($s) && strlen($s) % 2 === 0;
 }
 
-/* ================= READ UPDATE ================= */
+// ==========================================
+// 3. READ UPDATE
+// ==========================================
 $update = json_decode(file_get_contents("php://input"), true);
-if (!isset($update["message"]["text"])) exit;
+
+if (!isset($update["message"]["text"])) {
+    exit;
+}
 
 $chat_id    = $update["message"]["chat"]["id"];
 $message_id = $update["message"]["message_id"];
 $text       = trim($update["message"]["text"]);
 
-/* ================= IGNORE /START ================= */
-if ($text === "/start" || $text === "") exit;
+// ==========================================
+// 4. IGNORE /start OR EMPTY
+// ==========================================
+if ($text === "/start" || $text === "") {
+    exit;
+}
 
-/* ================= INVALID CONDITIONS ================= */
+// ==========================================
+// 5. INVALID INPUT → DELETE
+// ==========================================
 if (!isHexBase16($text) || strlen($text) < 10) {
-    // delete invalid message
-    @file_get_contents(
-        "$api/deleteMessage?chat_id=$chat_id&message_id=$message_id"
+    file_get_contents(
+        "{$apiUrl}/deleteMessage?chat_id={$chat_id}&message_id={$message_id}"
     );
     exit;
 }
 
-/* ================= DECODE HEX ================= */
+// ==========================================
+// 6. DECODE HEX
+// ==========================================
 $decoded = hex2bin($text);
+
 if ($decoded === false || !mb_check_encoding($decoded, 'UTF-8')) {
-    @file_get_contents(
-        "$api/deleteMessage?chat_id=$chat_id&message_id=$message_id"
+    file_get_contents(
+        "{$apiUrl}/deleteMessage?chat_id={$chat_id}&message_id={$message_id}"
     );
     exit;
 }
 
-/* ================= DELETE VALID USER MESSAGE ================= */
-@file_get_contents(
-    "$api/deleteMessage?chat_id=$chat_id&message_id=$message_id"
+// ==========================================
+// 7. DELETE USER MESSAGE
+// ==========================================
+file_get_contents(
+    "{$apiUrl}/deleteMessage?chat_id={$chat_id}&message_id={$message_id}"
 );
 
-/* ================= FORMAT MESSAGE ================= */
+// ==========================================
+// 8. FORMAT MESSAGE
+// ==========================================
 $msg = "<b>" . htmlspecialchars($decoded, ENT_QUOTES, 'UTF-8') . "</b>";
 
-/* ================= SEND BOT MESSAGE ================= */
+// ==========================================
+// 9. SEND BOT MESSAGE
+// ==========================================
 $data = [
     'chat_id'    => $chat_id,
     'text'       => $msg,
@@ -65,11 +85,9 @@ $options = [
 ];
 
 file_get_contents(
-    "$api/sendMessage",
+    "{$apiUrl}/sendMessage",
     false,
     stream_context_create($options)
 );
 
 ?>
-
-
