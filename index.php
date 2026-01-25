@@ -7,14 +7,7 @@ $botToken = "8336071481:AAG91IOKs6r3b5SGIrC_gR4tmfjOnV_dQE8"; // YOUR TOKEN
 $apiUrl   = "https://api.telegram.org/bot{$botToken}";
 
 // ==========================================
-// 2. FUNCTIONS
-// ==========================================
-function isHexBase16($s) {
-    return $s !== "" && ctype_xdigit($s) && strlen($s) % 2 === 0;
-}
-
-// ==========================================
-// 3. READ UPDATE
+// 2. READ WEBHOOK UPDATE
 // ==========================================
 $update = json_decode(file_get_contents("php://input"), true);
 
@@ -22,72 +15,183 @@ if (!isset($update["message"]["text"])) {
     exit;
 }
 
-$chat_id    = $update["message"]["chat"]["id"];
-$message_id = $update["message"]["message_id"];
-$text       = trim($update["message"]["text"]);
+$chatId = $update["message"]["chat"]["id"];
+$text   = trim($update["message"]["text"]);
+$msgId  = $update["message"]["message_id"];
 
 // ==========================================
-// 4. IGNORE /start OR EMPTY
+// 3. /START COMMAND
 // ==========================================
-if ($text === "/start" || $text === "") {
-    exit;
-}
-
-// ==========================================
-// 5. INVALID INPUT → DELETE
-// ==========================================
-if (!isHexBase16($text) || strlen($text) < 10) {
-    file_get_contents(
-        "{$apiUrl}/deleteMessage?chat_id={$chat_id}&message_id={$message_id}"
+if ($text === "/start") {
+    sendMessage(
+        $chatId,
+        "👋 <b>Send me a Spotify link</b>\n\n🎧 Track\n👤 Artist\n💿 Album\n📂 Playlist",
+        $msgId
     );
     exit;
 }
 
 // ==========================================
-// 6. DECODE HEX
+// 4. VALIDATE SPOTIFY URL
 // ==========================================
-$decoded = hex2bin($text);
-
-if ($decoded === false || !mb_check_encoding($decoded, 'UTF-8')) {
-    file_get_contents(
-        "{$apiUrl}/deleteMessage?chat_id={$chat_id}&message_id={$message_id}"
+if (!preg_match('~https?://open\.spotify\.com/(track|album|artist|playlist)/[a-zA-Z0-9]+~', $text)) {
+    sendMessage(
+        $chatId,
+        "❌ <b>Invalid Spotify link</b>\n\nExample:\n<code>https://open.spotify.com/track/...</code>",
+        $msgId
     );
     exit;
 }
 
 // ==========================================
-// 7. DELETE USER MESSAGE
+// 5. SHOW WORKING STATUS
 // ==========================================
 file_get_contents(
-    "{$apiUrl}/deleteMessage?chat_id={$chat_id}&message_id={$message_id}"
+    "{$apiUrl}/sendChatAction?chat_id={$chatId}&action=upload_audio"
 );
 
 // ==========================================
-// 8. FORMAT MESSAGE
+// 6. PROCESS SPOTIFY LINK
 // ==========================================
-$msg = "<b>" . htmlspecialchars($decoded, ENT_QUOTES, 'UTF-8') . "</b>";
+try {
+
+    $requestUrl = buildSpotidownRequest($text);
+
+    $context = stream_context_create([
+        "http" => [
+            "header"  => "User-Agent: Mozilla/5.0",
+            "timeout" => 25
+        ]
+    ]);
+
+    $response = @file_get_contents($requestUrl, false, $context);
+    $data = json_decode($response, true);
+
+    if (!$data) {
+        throw new Exception("Spotidown API did not respond.");
+    }
+
+    // Direct track
+    if (isset($data['audio']['url'])) {
+        processTrack($chatId, $msgId, $data);
+    }
+    // Collection (album/artist/playlist)
+    elseif (isset($data['tracks']) && is_array($data['tracks'])) {
+        $count = count($data['tracks']);
+
+        sendMessage(
+            $chatId,
+            "📂 <b>Collection detected</b>\nFound <b>{$count}</b> tracks.\nDownloading first track…",
+            $msgId
+        );
+
+        if ($count > 0) {
+            processTrack($chatId, $msgId, $data['tracks'][0]);
+        }
+    } else {
+        throw new Exception("No downloadable audio found.");
+    }
+
+} catch (Exception $e) {
+    sendMessage(
+        $chatId,
+        "⚠️ <b>Error:</b> " . htmlspecialchars($e->getMessage()),
+        $msgId
+    );
+}
 
 // ==========================================
-// 9. SEND BOT MESSAGE
+// 7. FUNCTIONS
 // ==========================================
-$data = [
-    'chat_id'    => $chat_id,
-    'text'       => $msg,
-    'parse_mode' => 'HTML'
-];
 
-$options = [
-    'http' => [
-        'method'  => 'POST',
-        'header'  => "Content-Type: application/x-www-form-urlencoded",
-        'content' => http_build_query($data)
-    ]
-];
+function processTrack($chatId, $replyId, $trackData) {
+    global $apiUrl;
 
-file_get_contents(
-    "{$apiUrl}/sendMessage",
-    false,
-    stream_context_create($options)
-);
+    if (!isset($trackData['audio']['url'])) {
+        if (isset($trackData['url'])) {
+            $req = buildSpotidownRequest($trackData['url']);
+            $json = file_get_contents($req);
+            $trackData = json_decode($json, true);
+        } else {
+            sendMessage($chatId, "❌ Audio URL missing.", $replyId);
+            return;
+        }
+    }
+
+    $audio   = $trackData['audio']['url'];
+    $title   = $trackData['name'] ?? 'Spotify Track';
+    $artist  = is_array($trackData['artists'])
+        ? implode(', ', $trackData['artists'])
+        : ($trackData['artists'] ?? 'Unknown Artist');
+
+    $album   = $trackData['album']['name'] ?? 'Spotify';
+    $thumb   = $trackData['album']['coverUrl'] ?? null;
+    $dur     = isset($trackData['duration']) ? floor($trackData['duration'] / 1000) : 0;
+
+    $data = [
+        'chat_id'  => $chatId,
+        'audio'    => $audio,
+        'caption'  => "🎧 <b>{$title}</b>\n👤 {$artist}\n💿 {$album}",
+        'parse_mode' => 'HTML',
+        'title'    => $title,
+        'performer'=> $artist,
+        'duration' => $dur,
+        'reply_to_message_id' => $replyId
+    ];
+
+    if ($thumb) {
+        $data['thumb'] = $thumb;
+    }
+
+    $ch = curl_init("{$apiUrl}/sendAudio");
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_exec($ch);
+    curl_close($ch);
+}
+
+function sendMessage($chatId, $text, $replyId = null) {
+    global $apiUrl;
+
+    $data = [
+        'chat_id' => $chatId,
+        'text' => $text,
+        'parse_mode' => 'HTML'
+    ];
+
+    if ($replyId) {
+        $data['reply_to_message_id'] = $replyId;
+    }
+
+    file_get_contents("{$apiUrl}/sendMessage?" . http_build_query($data));
+}
+
+function buildSpotidownRequest($spotifyUrl) {
+    $parsed = parse_url($spotifyUrl);
+    $path = $parsed['host'] . $parsed['path'];
+    $sigInput = "search/" . $path;
+    $sig = generateSig($sigInput);
+
+    return "https://api.spotidown.co/{$sigInput}?sig={$sig}";
+}
+
+function generateSig($input) {
+    $b64 = base64_encode($input);
+    $S = rand(0, strlen($b64) - 1);
+
+    $part1 = dechex($S * 666111444);
+    $rot   = substr($b64, $S) . substr($b64, 0, $S);
+    $part2 = strrev($rot);
+    $part3 = dechex($S * 666);
+
+    $noise = [];
+    foreach (str_split($b64) as $c) {
+        if (rand(0, 1)) $noise[] = $c;
+    }
+    shuffle($noise);
+
+    return $part1 . "_" . $part2 . "_" . $part3 . "_" . implode('', $noise);
+}
 
 ?>
