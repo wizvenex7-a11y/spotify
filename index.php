@@ -4,194 +4,214 @@
 // 1. CONFIGURATION
 // ==========================================
 $botToken = "8336071481:AAG91IOKs6r3b5SGIrC_gR4tmfjOnV_dQE8"; // YOUR TOKEN
-$apiUrl   = "https://api.telegram.org/bot{$botToken}";
+$apiUrl   = "https://api.telegram.org/bot$botToken";
 
 // ==========================================
-// 2. READ WEBHOOK UPDATE
+// 2. SPOTDL LOGIC CLASS
 // ==========================================
-$update = json_decode(file_get_contents("php://input"), true);
+class SpotDL {
+    private $cookieFile;
+    private $csrfToken = null;
+    private $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36';
 
-if (!isset($update["message"]["text"])) {
-    exit;
-}
-
-$chatId = $update["message"]["chat"]["id"];
-$text   = trim($update["message"]["text"]);
-$msgId  = $update["message"]["message_id"];
-
-// ==========================================
-// 3. /START COMMAND
-// ==========================================
-if ($text === "/start") {
-    sendMessage(
-        $chatId,
-        "👋 <b>Send me a Spotify link</b>\n\n🎧 Track\n👤 Artist\n💿 Album\n📂 Playlist",
-        $msgId
-    );
-    exit;
-}
-
-// ==========================================
-// 4. VALIDATE SPOTIFY URL
-// ==========================================
-if (!preg_match('~https?://open\.spotify\.com/(track|album|artist|playlist)/[a-zA-Z0-9]+~', $text)) {
-    sendMessage(
-        $chatId,
-        "❌ <b>Invalid Spotify link</b>\n\nExample:\n<code>https://open.spotify.com/track/...</code>",
-        $msgId
-    );
-    exit;
-}
-
-// ==========================================
-// 5. SHOW WORKING STATUS
-// ==========================================
-file_get_contents(
-    "{$apiUrl}/sendChatAction?chat_id={$chatId}&action=upload_audio"
-);
-
-// ==========================================
-// 6. PROCESS SPOTIFY LINK
-// ==========================================
-try {
-
-    $requestUrl = buildSpotidownRequest($text);
-
-    $context = stream_context_create([
-        "http" => [
-            "header"  => "User-Agent: Mozilla/5.0",
-            "timeout" => 25
-        ]
-    ]);
-
-    $response = @file_get_contents($requestUrl, false, $context);
-    $data = json_decode($response, true);
-
-    if (!$data) {
-        throw new Exception("Spotidown API did not respond.");
+    public function __construct() {
+        // Create a unique temporary file to store cookies for this session
+        $this->cookieFile = tempnam(sys_get_temp_dir(), 'spotdl_' . uniqid());
     }
 
-    // Direct track
-    if (isset($data['audio']['url'])) {
-        processTrack($chatId, $msgId, $data);
+    public function __destruct() {
+        // Clean up cookie file after execution
+        if (file_exists($this->cookieFile)) @unlink($this->cookieFile);
     }
-    // Collection (album/artist/playlist)
-    elseif (isset($data['tracks']) && is_array($data['tracks'])) {
-        $count = count($data['tracks']);
 
-        sendMessage(
-            $chatId,
-            "📂 <b>Collection detected</b>\nFound <b>{$count}</b> tracks.\nDownloading first track…",
-            $msgId
-        );
+    // REQUEST 1: Visit v2 to get CSRF Token and Cookies
+    public function initSession() {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, 'https://spotdl.io/v2');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_COOKIEJAR, $this->cookieFile); // Save cookies
+        curl_setopt($ch, CURLOPT_COOKIEFILE, $this->cookieFile);
+        curl_setopt($ch, CURLOPT_ENCODING, ''); // Handle gzip
+        
+        // precise headers from your curl
+        $headers = [
+            'accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-language: en-GB,en-US;q=0.9,en;q=0.8,ar;q=0.7',
+            'cache-control: max-age=0',
+            'priority: u=0, i',
+            'referer: https://spotdl.io/v2',
+            'sec-ch-ua: "Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+            'sec-ch-ua-mobile: ?0',
+            'sec-ch-ua-platform: "Windows"',
+            'sec-fetch-dest: document',
+            'sec-fetch-mode: navigate',
+            'sec-fetch-site: same-origin',
+            'sec-fetch-user: ?1',
+            'upgrade-insecure-requests: 1',
+            'user-agent: ' . $this->userAgent
+        ];
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        
+        $html = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
 
-        if ($count > 0) {
-            processTrack($chatId, $msgId, $data['tracks'][0]);
+        if ($code !== 200) return false;
+
+        // Extract CSRF Token
+        if (preg_match('/<meta\s+name="csrf-token"\s+content="(.*?)"/', $html, $matches)) {
+            $this->csrfToken = $matches[1];
+            return true;
         }
-    } else {
-        throw new Exception("No downloadable audio found.");
+        return false;
     }
 
-} catch (Exception $e) {
-    sendMessage(
-        $chatId,
-        "⚠️ <b>Error:</b> " . htmlspecialchars($e->getMessage()),
-        $msgId
-    );
+    // REQUEST 2: Get Metadata
+    public function getTrackData($spotifyUrl) {
+        if (!$this->csrfToken) $this->initSession();
+
+        return $this->postRequest('https://spotdl.io/getTrackData', [
+            'spotify_url' => $spotifyUrl
+        ]);
+    }
+
+    // REQUEST 3: Convert/Get MP3
+    public function convert($spotifyUrl) {
+        // Ensure session exists
+        if (!$this->csrfToken) $this->initSession();
+
+        return $this->postRequest('https://spotdl.io/convert', [
+            'urls' => $spotifyUrl
+        ]);
+    }
+
+    private function postRequest($url, $data) {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_COOKIEJAR, $this->cookieFile); // Keep using same cookies
+        curl_setopt($ch, CURLOPT_COOKIEFILE, $this->cookieFile);
+        
+        // Headers for API calls
+        $headers = [
+            'accept: */*',
+            'accept-language: en-GB,en-US;q=0.9,en;q=0.8,ar;q=0.7',
+            'content-type: application/json',
+            'origin: https://spotdl.io',
+            'priority: u=1, i',
+            'referer: https://spotdl.io/v2',
+            'sec-ch-ua: "Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+            'sec-ch-ua-mobile: ?0',
+            'sec-ch-ua-platform: "Windows"',
+            'sec-fetch-dest: empty',
+            'sec-fetch-mode: cors',
+            'sec-fetch-site: same-origin',
+            'user-agent: ' . $this->userAgent,
+            'x-csrf-token: ' . $this->csrfToken
+        ];
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+
+        $response = curl_exec($ch);
+        curl_close($ch);
+        
+        return json_decode($response, true);
+    }
 }
 
 // ==========================================
-// 7. FUNCTIONS
+// 3. TELEGRAM BOT HANDLER
 // ==========================================
 
-function processTrack($chatId, $replyId, $trackData) {
+$content = file_get_contents("php://input");
+$update  = json_decode($content, true);
+
+if (isset($update["message"]["text"])) {
+    $chatId = $update["message"]["chat"]["id"];
+    $text   = trim($update["message"]["text"]);
+    $msgId  = $update["message"]["message_id"];
+
+    // 1. /start
+    if ($text === "/start") {
+        sendMessage($chatId, "👋 Send a Spotify link (Track, Artist, or Album).", $msgId);
+        exit;
+    }
+
+    // 2. Validate Link
+    if (!preg_match('/open\.spotify\.com\/(track|artist|album|playlist)\/[a-zA-Z0-9]+/', $text)) {
+        sendMessage($chatId, "❌ Invalid Spotify Link.", $msgId);
+        exit;
+    }
+
+    // 3. Send Status
+    file_get_contents("$apiUrl/sendChatAction?chat_id=$chatId&action=upload_voice");
+
+    try {
+        $spotDl = new SpotDL();
+
+        // REQ 1: Init Session (Implicitly called by getTrackData)
+        
+        // REQ 2: Get Metadata
+        $meta = $spotDl->getTrackData($text);
+        
+        if (!isset($meta['data'])) {
+            // If failed, try initialization explicitly and try again
+            if (!$spotDl->initSession()) {
+                throw new Exception("Failed to bypass Cloudflare/Init session.");
+            }
+            $meta = $spotDl->getTrackData($text);
+            if (!isset($meta['data'])) throw new Exception("Could not fetch metadata.");
+        }
+
+        // Prepare Metadata
+        $title  = $meta['data']['name'];
+        $artist = $meta['data']['artists'][0]['name'] ?? 'Unknown';
+        $cover  = $meta['data']['album']['images'][0]['url'] ?? '';
+        $dur    = floor(($meta['data']['duration_ms'] ?? 0) / 1000);
+
+        // REQ 3: Convert/Download
+        $convert = $spotDl->convert($text);
+
+        if (!isset($convert['file_url'])) {
+            throw new Exception("Conversion failed or still processing.");
+        }
+
+        $mp3Url = $convert['file_url'];
+
+        // Send Audio
+        $postData = [
+            'chat_id'   => $chatId,
+            'audio'     => $mp3Url,
+            'caption'   => "🎧 <b>$title</b>\n👤 $artist",
+            'parse_mode'=> 'HTML',
+            'title'     => $title,
+            'performer' => $artist,
+            'duration'  => $dur,
+            'thumb'     => $cover,
+            'reply_to_message_id' => $msgId
+        ];
+
+        $ch = curl_init("$apiUrl/sendAudio");
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $res = curl_exec($ch);
+        curl_close($ch);
+
+    } catch (Exception $e) {
+        sendMessage($chatId, "⚠️ Error: " . $e->getMessage(), $msgId);
+    }
+}
+
+function sendMessage($chatId, $text, $replyId) {
     global $apiUrl;
-
-    if (!isset($trackData['audio']['url'])) {
-        if (isset($trackData['url'])) {
-            $req = buildSpotidownRequest($trackData['url']);
-            $json = file_get_contents($req);
-            $trackData = json_decode($json, true);
-        } else {
-            sendMessage($chatId, "❌ Audio URL missing.", $replyId);
-            return;
-        }
-    }
-
-    $audio   = $trackData['audio']['url'];
-    $title   = $trackData['name'] ?? 'Spotify Track';
-    $artist  = is_array($trackData['artists'])
-        ? implode(', ', $trackData['artists'])
-        : ($trackData['artists'] ?? 'Unknown Artist');
-
-    $album   = $trackData['album']['name'] ?? 'Spotify';
-    $thumb   = $trackData['album']['coverUrl'] ?? null;
-    $dur     = isset($trackData['duration']) ? floor($trackData['duration'] / 1000) : 0;
-
     $data = [
-        'chat_id'  => $chatId,
-        'audio'    => $audio,
-        'caption'  => "🎧 <b>{$title}</b>\n👤 {$artist}\n💿 {$album}",
-        'parse_mode' => 'HTML',
-        'title'    => $title,
-        'performer'=> $artist,
-        'duration' => $dur,
+        'chat_id' => $chatId, 
+        'text' => $text, 
+        'parse_mode' => 'HTML', 
         'reply_to_message_id' => $replyId
     ];
-
-    if ($thumb) {
-        $data['thumb'] = $thumb;
-    }
-
-    $ch = curl_init("{$apiUrl}/sendAudio");
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_exec($ch);
-    curl_close($ch);
+    file_get_contents("$apiUrl/sendMessage?" . http_build_query($data));
 }
-
-function sendMessage($chatId, $text, $replyId = null) {
-    global $apiUrl;
-
-    $data = [
-        'chat_id' => $chatId,
-        'text' => $text,
-        'parse_mode' => 'HTML'
-    ];
-
-    if ($replyId) {
-        $data['reply_to_message_id'] = $replyId;
-    }
-
-    file_get_contents("{$apiUrl}/sendMessage?" . http_build_query($data));
-}
-
-function buildSpotidownRequest($spotifyUrl) {
-    $parsed = parse_url($spotifyUrl);
-    $path = $parsed['host'] . $parsed['path'];
-    $sigInput = "search/" . $path;
-    $sig = generateSig($sigInput);
-
-    return "https://api.spotidown.co/{$sigInput}?sig={$sig}";
-}
-
-function generateSig($input) {
-    $b64 = base64_encode($input);
-    $S = rand(0, strlen($b64) - 1);
-
-    $part1 = dechex($S * 666111444);
-    $rot   = substr($b64, $S) . substr($b64, 0, $S);
-    $part2 = strrev($rot);
-    $part3 = dechex($S * 666);
-
-    $noise = [];
-    foreach (str_split($b64) as $c) {
-        if (rand(0, 1)) $noise[] = $c;
-    }
-    shuffle($noise);
-
-    return $part1 . "_" . $part2 . "_" . $part3 . "_" . implode('', $noise);
-}
-
 ?>
