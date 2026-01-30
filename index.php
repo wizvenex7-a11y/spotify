@@ -1,15 +1,16 @@
 <?php
+// Prevent timeouts
+set_time_limit(0);
+ignore_user_abort(true);
+
 // ==========================================
 // 1. CONFIGURATION
 // ==========================================
 $botToken = "8336071481:AAG91IOKs6r3b5SGIrC_gR4tmfjOnV_dQE8"; 
 
-// Spotify Developer Keys (https://developer.spotify.com/dashboard)
+// Spotify Keys
 $spotifyClientId = "e63d57e08bd7427ea40dc4a17de9b6e2";
 $spotifyClientSecret = "48693228f719476697c29aebaf0765f7";
-
-// Path to FFmpeg (leave empty "" if you don't have it, but metadata won't be embedded in file)
-$ffmpeg_path = "C:/ffmpeg/bin/ffmpeg.exe"; // Linux example: "/usr/bin/ffmpeg"
 
 // ==========================================
 // 2. SPOTIFY METADATA CLASS
@@ -55,68 +56,63 @@ class SpotifyMetadata {
 }
 
 // ==========================================
-// 3. DOWNLOADER CLASS (SpotMate - No CSRF)
+// 3. DOWNLOADER CLASS (SpotIMP3 API)
 // ==========================================
-class SpotMateDownloader {
-    private $ch;
-    private $cookieJar;
-    public $lastError = '';
-
-    public function __construct() {
-        $this->cookieJar = tempnam(sys_get_temp_dir(), 'spot_cookie_');
-        $this->ch = curl_init();
-        curl_setopt_array($this->ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_COOKIEJAR => $this->cookieJar,
-            CURLOPT_COOKIEFILE => $this->cookieJar,
-            CURLOPT_TIMEOUT => 60,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        ]);
-    }
-
-    public function __destruct() {
-        if ($this->ch) curl_close($this->ch);
-        if (file_exists($this->cookieJar)) @unlink($this->cookieJar);
-    }
-
-    private function requestConversion($url) {
-        $payload = json_encode(['urls' => $url]);
-        curl_setopt($this->ch, CURLOPT_URL, 'https://spotmate.online/convert');
-        curl_setopt($this->ch, CURLOPT_POST, true);
-        curl_setopt($this->ch, CURLOPT_POSTFIELDS, $payload);
-        curl_setopt($this->ch, CURLOPT_HTTPHEADER, [
+class SpotImp3Downloader {
+    
+    // Step 1: Request the download link from the API
+    private function getApiLink($spotifyUrl) {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, 'https://spotimp3.net/api/download');
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(['url' => $spotifyUrl]));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        
+        // Exact headers from your request
+        $headers = [
+            'sec-ch-ua-platform: "Windows"',
+            'Referer: https://spotimp3.net/tl1/album',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+            'Accept: application/json, text/plain, */*',
+            'sec-ch-ua: "Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
             'Content-Type: application/json',
-            'Origin: https://spotmate.online',
-            'Referer: https://spotmate.online/en1'
-        ]);
-        return json_decode(curl_exec($this->ch), true);
+            'sec-ch-ua-mobile: ?0'
+        ];
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        
+        $response = curl_exec($ch);
+        curl_close($ch);
+        
+        return json_decode($response, true);
     }
 
-    private function downloadFile($url) {
-        curl_setopt($this->ch, CURLOPT_URL, $url);
-        curl_setopt($this->ch, CURLOPT_HTTPGET, true);
-        curl_setopt($this->ch, CURLOPT_HTTPHEADER, []); 
-        $data = curl_exec($this->ch);
-        return (curl_getinfo($this->ch, CURLINFO_HTTP_CODE) == 200) ? $data : false;
+    // Step 2: Download the actual file from the link provided by API
+    private function downloadFile($fileUrl) {
+        $ch = curl_init($fileUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36');
+        $data = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        
+        return ($code == 200) ? $data : false;
     }
 
     public function getSong($spotifyUrl) {
-        $res = $this->requestConversion($spotifyUrl);
-        if (!$res) { $this->lastError = "API Error"; return false; }
+        // 1. Call API
+        $res = $this->getApiLink($spotifyUrl);
+        
+        if (!$res) return false;
 
-        if (isset($res['url']) && !empty($res['url'])) return $this->downloadFile($res['url']);
+        // 2. Extract Download URL (Adjust based on API response structure)
+        // Common keys: 'download_url', 'link', 'url', 'file_url'
+        $downloadUrl = $res['download_url'] ?? $res['link'] ?? $res['url'] ?? $res['file_url'] ?? null;
 
-        if (($res['status'] ?? '') !== 'queued') { $this->lastError = "Not Queued"; return false; }
+        if (!$downloadUrl) return false;
 
-        // Polling (3 Attempts)
-        for ($i=0; $i<3; $i++) {
-            sleep(5); // Wait 5s
-            $res = $this->requestConversion($spotifyUrl);
-            if (isset($res['url']) && !empty($res['url'])) return $this->downloadFile($res['url']);
-        }
-        $this->lastError = "Timeout";
-        return false;
+        // 3. Download the MP3
+        return $this->downloadFile($downloadUrl);
     }
 }
 
@@ -132,7 +128,7 @@ if (isset($update["message"]["text"])) {
     $text = trim($update["message"]["text"]);
     $msgId = $update["message"]["message_id"];
 
-    // 1. Basic Commands
+    // 1. Start Command
     if ($text == "/start") {
         sendMessage($chatId, "👋 <b>Ready!</b> Send me a Spotify Track Link.", $msgId);
         exit;
@@ -140,15 +136,14 @@ if (isset($update["message"]["text"])) {
 
     // 2. Validate Link
     if (strpos($text, "spotify.com/track/") === false) {
-        sendMessage($chatId, "❌ Please send a valid Spotify Track link.", $msgId);
-        exit;
+        exit; // Ignore non-spotify messages
     }
 
-    // 3. Extract ID
+    // 3. Extract Track ID
     if (preg_match('/track\/([a-zA-Z0-9]{22})/', $text, $m)) {
         $trackId = $m[1];
     } else {
-        sendMessage($chatId, "❌ Could not parse Track ID.", $msgId);
+        sendMessage($chatId, "❌ Invalid Link Format.", $msgId);
         exit;
     }
     
@@ -156,7 +151,7 @@ if (isset($update["message"]["text"])) {
 
     // Notify User
     sendMessage($chatId, "🔍 <b>Searching Metadata...</b>", $msgId);
-    sendAction($chatId, "upload_voice"); // Show "recording audio..." status
+    sendAction($chatId, "upload_voice"); 
 
     try {
         // --- A. GET METADATA ---
@@ -164,7 +159,7 @@ if (isset($update["message"]["text"])) {
         $meta = $spotify->getTrack($trackId);
 
         if (!$meta || isset($meta['error'])) {
-            throw new Exception("Metadata failed. Check Client ID/Secret.");
+            throw new Exception("Metadata failed. Invalid API Keys.");
         }
 
         $title = $meta['name'];
@@ -173,63 +168,53 @@ if (isset($update["message"]["text"])) {
         $coverUrl = $meta['album']['images'][0]['url'] ?? null;
         $duration = floor($meta['duration_ms'] / 1000);
 
-        // Notify Downloading
-        // editMessage($chatId, $sentMsgId, "⬇️ <b>Downloading... (Attempt 1/3)</b>"); // (Optional if you track msg IDs)
-
-        // --- B. DOWNLOAD LOOP (3 RETRIES) ---
-        $downloader = new SpotMateDownloader();
+        // --- B. DOWNLOAD AUDIO (3 RETRIES) ---
+        // sendMessage($chatId, "⬇️ Downloading from SpotIMP3...", $msgId);
+        
+        $downloader = new SpotImp3Downloader();
         $mp3Data = false;
+        $maxRetries = 3;
         $attempt = 0;
         
-        while ($attempt < 3 && !$mp3Data) {
+        while ($attempt < $maxRetries) {
             $attempt++;
-            if ($attempt > 1) sleep(3); // Wait before retry
             $mp3Data = $downloader->getSong($fullUrl);
+            
+            if ($mp3Data) {
+                break; // Success
+            } else {
+                if ($attempt < $maxRetries) sleep(3); // Wait 3s before retry
+            }
         }
 
         if (!$mp3Data) {
-            throw new Exception("Download failed after 3 attempts.");
+            throw new Exception("Download failed after 3 attempts via SpotIMP3.");
         }
 
-        // --- C. SAVE TEMP FILES ---
-        $baseName = sys_get_temp_dir() . "/spot_" . time();
-        $mp3Path = $baseName . ".mp3";
-        $finalPath = $baseName . "_final.mp3";
-        $coverPath = $baseName . ".jpg";
-
-        file_put_contents($mp3Path, $mp3Data);
-        if ($coverUrl) file_put_contents($coverPath, file_get_contents($coverUrl));
-
-        // --- D. FFMPEG TAGGING (Optional) ---
-        if ($coverUrl && !empty($ffmpeg_path) && file_exists($ffmpeg_path)) {
-            // Embed cover art and ID3 tags
-            $cmd = sprintf(
-                '%s -y -i %s -i %s -map 0:a -map 1:v -metadata title=%s -metadata artist=%s -metadata album=%s -c copy -disposition:v:0 attached_pic -id3v2_version 3 %s 2>&1',
-                escapeshellarg($ffmpeg_path),
-                escapeshellarg($mp3Path),
-                escapeshellarg($coverPath),
-                escapeshellarg($title),
-                escapeshellarg($artist),
-                escapeshellarg($album),
-                escapeshellarg($finalPath)
-            );
-            exec($cmd, $out, $ret);
-            
-            if ($ret === 0 && file_exists($finalPath)) {
-                $uploadPath = $finalPath; // Use the tagged file
-            } else {
-                $uploadPath = $mp3Path; // Fallback to untagged
-            }
-        } else {
-            $uploadPath = $mp3Path;
-        }
-
-        // --- E. UPLOAD TO TELEGRAM ---
+        // --- C. PREPARE UPLOAD ---
         sendAction($chatId, "upload_document");
 
+        // Save files to temp directory
+        $tempDir = sys_get_temp_dir();
+        $tempMp3 = tempnam($tempDir, 'mp3');
+        $tempThumb = tempnam($tempDir, 'jpg');
+
+        file_put_contents($tempMp3, $mp3Data);
+        
+        $hasCover = false;
+        if ($coverUrl) {
+            $coverData = file_get_contents($coverUrl);
+            if ($coverData) {
+                file_put_contents($tempThumb, $coverData);
+                $hasCover = true;
+            }
+        }
+
+        // --- D. SEND TO TELEGRAM ---
+        // We send the cover as 'thumb' so it shows in the player
         $postFields = [
             'chat_id' => $chatId,
-            'audio' => new CURLFile($uploadPath),
+            'audio' => new CURLFile($tempMp3, 'audio/mpeg', "$artist - $title.mp3"),
             'caption' => "🎧 <b>$title</b>\n👤 $artist\n💿 $album",
             'parse_mode' => 'HTML',
             'title' => $title,
@@ -238,9 +223,8 @@ if (isset($update["message"]["text"])) {
             'reply_to_message_id' => $msgId
         ];
 
-        // Attach Thumbnail for Telegram Player if cover exists
-        if (file_exists($coverPath)) {
-            $postFields['thumb'] = new CURLFile($coverPath);
+        if ($hasCover) {
+            $postFields['thumb'] = new CURLFile($tempThumb, 'image/jpeg', 'thumb.jpg');
         }
 
         $ch = curl_init("https://api.telegram.org/bot$botToken/sendAudio");
@@ -250,10 +234,9 @@ if (isset($update["message"]["text"])) {
         $res = curl_exec($ch);
         curl_close($ch);
 
-        // Cleanup
-        @unlink($mp3Path);
-        @unlink($finalPath);
-        @unlink($coverPath);
+        // Cleanup Temp Files
+        @unlink($tempMp3);
+        @unlink($tempThumb);
 
         $jsonRes = json_decode($res, true);
         if (!$jsonRes['ok']) {
@@ -270,7 +253,13 @@ function sendMessage($chatId, $text, $replyId = null) {
     global $botToken;
     $data = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => 'HTML'];
     if ($replyId) $data['reply_to_message_id'] = $replyId;
-    file_get_contents("https://api.telegram.org/bot$botToken/sendMessage?" . http_build_query($data));
+    
+    $ch = curl_init("https://api.telegram.org/bot$botToken/sendMessage");
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_exec($ch);
+    curl_close($ch);
 }
 
 function sendAction($chatId, $action) {
